@@ -1,9 +1,14 @@
+import logging
+
+logging.basicConfig(level=logging.ERROR)
+
 def process_payment(request):
-    if "amount" not in request or "billing_address" not in request:
-        raise ValueError("Request is missing required fields: amount and billing_address")
-    
     amount = request["amount"]
-    address = request["billing_address"]
+    if "billing_address" in request:
+        address = request["billing_address"]
+    else:
+        logging.error("Missing 'billing_address' in request. Please ensure that the request includes a valid 'billing_address'.")
+        raise ValueError("The 'billing_address' key is required for payment processing. Please check the request and try again.")
 
     return {
         "amount": amount,
