@@ -1,9 +1,11 @@
 def process_payment(request):
-    amount = request["amount"]
-    if "billing_address" in request:
-        address = request["billing_address"]
-    else:
+    if "amount" not in request:
+        raise ValueError("Missing 'amount' in the request")
+    if "billing_address" not in request:
         raise ValueError("Missing 'billing_address' in the request")
+    
+    amount = request["amount"]
+    address = request["billing_address"]
 
     return {
         "amount": amount,
