@@ -3,7 +3,8 @@ def process_payment(request):
     if "billing_address" in request:
         address = request["billing_address"]
     else:
-        raise ValueError("Missing 'billing_address' in the request")
+        # Raise ValueError when the "billing_address" key is missing
+        raise ValueError("Missing billing_address in request")
 
     return {
         "amount": amount,
