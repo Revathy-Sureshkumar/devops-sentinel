@@ -1,7 +1,9 @@
 import re
+from pathlib import Path
 
 from app.agents.investigator import investigate
 from app.agents.qa_reviewer import review_patch
+from app.agents.incident_detector import detect_jira_incident
 
 from app.tools.repository import read_file
 from app.tools.patch import apply_file_patch, run_tests
@@ -12,13 +14,58 @@ from app.tools.github import (
     create_pull_request,
 )
 
+from app.tools.jira import get_jira_incident
+
+
 MAX_REVISIONS = 3
 
+
+# =============================================================
+# PATH RESOLUTION
+# =============================================================
+
+def resolve_repository_path(file_path: str) -> str:
+    """
+    Resolve a production/repository-relative file path to the
+    local repository workspace used by the demo.
+
+    Example:
+
+        app/services/payment.py
+            ↓
+        demo/sample_repo/app/services/payment.py
+    """
+
+    path = Path(file_path)
+
+    # Case 1:
+    # The path already exists exactly as reported.
+    if path.exists():
+        return str(path)
+
+    # Case 2:
+    # Jira/production logs usually contain repository-relative
+    # paths such as app/services/payment.py.
+    demo_path = Path("demo/sample_repo") / path
+
+    if demo_path.exists():
+        return str(demo_path)
+
+    # Case 3:
+    # Return original path so the caller can report the
+    # appropriate "file not found" error.
+    return file_path
+
+
+# =============================================================
+# PATCH EXTRACTION
+# =============================================================
 
 def extract_patch(result: str) -> str:
     """Extract PATCH from investigator response."""
 
-    # XML-style format: <patch>...</patch>
+    # XML-style format:
+    # <patch>...</patch>
     match = re.search(
         r"<patch>\s*(.*?)\s*</patch>",
         result,
@@ -28,7 +75,9 @@ def extract_patch(result: str) -> str:
     if match:
         return match.group(1).strip()
 
-    # Plain-text format: PATCH: ... ASSUMPTIONS:
+    # Plain-text format:
+    # PATCH: ...
+    # ASSUMPTIONS:
     match = re.search(
         r"PATCH:\s*(.*?)(?=\nASSUMPTIONS:|\Z)",
         result,
@@ -40,6 +89,10 @@ def extract_patch(result: str) -> str:
 
     return ""
 
+
+# =============================================================
+# FILE PATH EXTRACTION
+# =============================================================
 
 def extract_file_path(incident: str) -> str | None:
     """Extract the source file path from the incident."""
@@ -58,8 +111,16 @@ def extract_file_path(incident: str) -> str | None:
     return None
 
 
+# =============================================================
+# PYTHON CODE EXTRACTION
+# =============================================================
+
 def extract_python_code(patch: str) -> str:
-    """Extract Python code from a fenced code block."""
+    """
+    Extract executable Python code from an investigator patch.
+
+    Also normalizes escaped quotes returned by the model.
+    """
 
     match = re.search(
         r"```python\s*(.*?)```",
@@ -67,23 +128,53 @@ def extract_python_code(patch: str) -> str:
         re.DOTALL | re.IGNORECASE,
     )
 
-    if match:
-        return match.group(1).strip()
+    if not match:
+        # Fallback for generic fenced code
+        match = re.search(
+            r"```\s*(.*?)```",
+            patch,
+            re.DOTALL,
+        )
 
-    # Fallback for generic fenced code
-    match = re.search(
-        r"```\s*(.*?)```",
-        patch,
-        re.DOTALL,
-    )
+    if not match:
+        return ""
 
-    if match:
-        return match.group(1).strip()
+    code = match.group(1).strip()
 
-    return ""
+    # Models can sometimes return:
+    #
+    # raise ValueError(\"billing_address\")
+    #
+    # Convert this into valid Python:
+    #
+    # raise ValueError("billing_address")
+    code = code.replace('\\"', '"')
 
+    return code
+
+
+# =============================================================
+# EXISTING DEVOPS SENTINEL WORKFLOW
+# =============================================================
 
 def run_incident_workflow(incident: str) -> None:
+    """
+    Existing DevOpsSentinel remediation workflow.
+
+    Investigator
+        ↓
+    QA / Safety
+        ↓
+    Patch
+        ↓
+    Regression Tests
+        ↓
+    GitHub Branch
+        ↓
+    Commit
+        ↓
+    Pull Request
+    """
 
     print("\n========================================")
     print("      DEVOPS SENTINEL WORKFLOW")
@@ -110,15 +201,37 @@ def run_incident_workflow(incident: str) -> None:
     # FILE IDENTIFICATION
     # ---------------------------------------------------------
 
-    file_path = extract_file_path(incident)
+    reported_file_path = extract_file_path(incident)
 
-    if not file_path:
+    if not reported_file_path:
         print("\n❌ Could not identify the source file.")
         return
 
-    print(f"\n📄 Target file: {file_path}")
+    print(f"\n📄 Reported file: {reported_file_path}")
+
+    # ---------------------------------------------------------
+    # RESOLVE PRODUCTION PATH → LOCAL WORKSPACE
+    # ---------------------------------------------------------
+
+    file_path = resolve_repository_path(reported_file_path)
+
+    print(f"📂 Resolved local file: {file_path}")
+
+    if not Path(file_path).exists():
+        print(
+            f"\n❌ File not found after path resolution: "
+            f"{file_path}"
+        )
+        return
+
+    # ---------------------------------------------------------
+    # READ ORIGINAL SOURCE
+    # ---------------------------------------------------------
 
     source_code = read_file(file_path)
+
+    # Keep an immutable copy for retry/revision logic.
+    original_source_code = source_code
 
     # ---------------------------------------------------------
     # QA + REVISION LOOP
@@ -192,6 +305,8 @@ IMPORTANT:
 - Do NOT use comments such as "# rest of the code".
 - Preserve the existing return structure.
 - Return executable Python code inside PATCH.
+- Do not escape Python quotes with backslashes.
+- The PATCH must be valid Python syntax.
 
 Return:
 
@@ -216,7 +331,9 @@ ASSUMPTIONS:
             patch = extract_patch(investigation)
 
             if not patch:
-                print("\n❌ Revised investigation did not contain a patch.")
+                print(
+                    "\n❌ Revised investigation did not contain a patch."
+                )
                 return
 
             continue
@@ -344,13 +461,32 @@ Please review the generated code before merging.
             return
 
         # -----------------------------------------------------
-        # TEST FAILURE → INVESTIGATOR
+        # TEST FAILURE → RESTORE → INVESTIGATOR
         # -----------------------------------------------------
 
         print("\n❌ Regression tests failed.")
-        print("🔄 Sending test failure back to Investigator...\n")
+        print("🔄 Restoring source before retry...\n")
 
-        source_code = read_file(file_path)
+        # Read the currently patched source.
+        current_source = read_file(file_path)
+
+        # Restore the source to its state before the failed patch.
+        restore_result = apply_file_patch(
+            file_path=file_path,
+            old_text=current_source,
+            new_text=source_code,
+        )
+
+        print(f"🔄 Source restore result: {restore_result}")
+
+        if restore_result.startswith("ERROR"):
+            print("\n❌ Could not restore source after failed tests.")
+            return
+
+        # Make sure the working source is restored.
+        source_code = original_source_code
+
+        print("🔄 Sending test failure back to Investigator...\n")
 
         revision_prompt = f"""
 The patch was approved by the QA/Safety Agent,
@@ -360,11 +496,11 @@ INCIDENT:
 
 {incident}
 
-UPDATED SOURCE CODE:
+ORIGINAL SOURCE CODE:
 
 {source_code}
 
-PATCH:
+FAILED PATCH:
 
 {patch}
 
@@ -372,16 +508,21 @@ TEST RESULT:
 
 {test_result}
 
-Investigate the failure and create a corrected patch.
+Create a corrected patch that fixes the test failure.
 
 IMPORTANT:
-- Preserve existing functionality.
+- The source code has been restored to its original state.
+- Make the smallest safe production fix.
 - Do not introduce fake/default production data.
-- Make the smallest safe correction.
+- Do not use "Default Address", "N/A", or fabricated values.
+- Preserve existing functionality.
+- Preserve existing business logic.
+- Preserve the existing return structure.
 - Return the COMPLETE replacement function.
 - Do NOT use "# rest of the code".
-- Preserve the existing return structure.
 - Return executable Python code inside PATCH.
+- Do not escape Python quotes with backslashes.
+- The generated PATCH must be valid Python syntax.
 
 Return:
 
@@ -413,28 +554,179 @@ ASSUMPTIONS:
     print("➡️ Human engineer review required.")
 
 
-if __name__ == "__main__":
+# =============================================================
+# JIRA INTEGRATION
+# =============================================================
 
-    incident = """
-Production Incident
+def _read_first_log_attachment(jira_data: dict) -> tuple[str, str]:
+    """
+    Read the first downloaded log/text attachment.
 
-Service: payment-service
+    Returns:
+        (filename, log_content)
+    """
 
-Severity: HIGH
+    downloaded_files = jira_data.get(
+        "downloaded_attachments",
+        [],
+    )
 
-Error:
+    if not downloaded_files:
+        raise RuntimeError(
+            "No Jira log attachment was downloaded."
+        )
 
-KeyError: 'billing_address'
+    # Prefer log/text files.
+    preferred_files = [
+        path
+        for path in downloaded_files
+        if Path(path).suffix.lower()
+        in {".log", ".txt", ".out", ".trace"}
+    ]
 
-Stack Trace:
+    if preferred_files:
+        file_path = preferred_files[0]
+    else:
+        file_path = downloaded_files[0]
 
-Traceback (most recent call last):
+    path = Path(file_path)
 
-  File "demo/sample_repo/app/services/payment.py", line 3, in process_payment
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Downloaded Jira attachment not found: {file_path}"
+        )
 
-    address = request["billing_address"]
+    log_content = path.read_text(
+        encoding="utf-8",
+        errors="replace",
+    )
 
-KeyError: 'billing_address'
-"""
+    return path.name, log_content
+
+
+def run_jira_incident_workflow(issue_key: str) -> None:
+    """
+    Start DevOpsSentinel remediation from a Jira incident.
+
+    Flow:
+
+    Jira
+        ↓
+    Ticket + attachment
+        ↓
+    Incident Detector
+        ↓
+    Existing remediation workflow
+        ↓
+    Investigator
+        ↓
+    QA
+        ↓
+    Tests
+        ↓
+    GitHub PR
+    """
+
+    print("\n========================================")
+    print("      DEVOPS SENTINEL + JIRA")
+    print("========================================\n")
+
+    # ---------------------------------------------------------
+    # JIRA INGESTION
+    # ---------------------------------------------------------
+
+    print(
+        f"🎫 Fetching Jira incident: {issue_key}\n"
+    )
+
+    jira_data = get_jira_incident(issue_key)
+
+    print(
+        f"✅ Jira issue retrieved: "
+        f"{jira_data.get('key')}"
+    )
+
+    print(
+        f"📌 Summary: "
+        f"{jira_data.get('summary')}"
+    )
+
+    print(
+        f"📊 Status: "
+        f"{jira_data.get('status')}"
+    )
+
+    print("\n📄 Jira Description:")
+    print(jira_data.get("description", ""))
+
+    # ---------------------------------------------------------
+    # LOG ATTACHMENT
+    # ---------------------------------------------------------
+
+    print("\n📎 Processing Jira attachment...")
+
+    filename, log_content = _read_first_log_attachment(
+        jira_data
+    )
+
+    print(
+        f"✅ Log attachment loaded: {filename}"
+    )
+
+    # ---------------------------------------------------------
+    # INCIDENT DETECTOR
+    # ---------------------------------------------------------
+
+    print(
+        "\n🚨 Incident Detector Agent: "
+        "normalizing Jira incident...\n"
+    )
+
+    incident = detect_jira_incident(
+        description=jira_data.get(
+            "description",
+            "",
+        ),
+        log_content=log_content,
+        issue_key=jira_data.get(
+            "key",
+            issue_key,
+        ),
+    )
+
+    print("\n=== STRUCTURED PRODUCTION INCIDENT ===")
+    print(incident)
+
+    # ---------------------------------------------------------
+    # EXISTING REMEDIATION WORKFLOW
+    # ---------------------------------------------------------
+
+    print(
+        "\n🚀 Starting existing "
+        "DevOpsSentinel remediation workflow..."
+    )
 
     run_incident_workflow(incident)
+
+
+# =============================================================
+# LOCAL TEST
+# =============================================================
+
+if __name__ == "__main__":
+
+    # Jira
+    #   ↓
+    # Incident Detector
+    #   ↓
+    # Investigator
+    #   ↓
+    # QA
+    #   ↓
+    # Patch
+    #   ↓
+    # Tests
+    #   ↓
+    # GitHub PR
+
+    run_jira_incident_workflow("SCRUM-1")

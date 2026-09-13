@@ -1,0 +1,10 @@
+2026-09-13T12:55:31Z ERROR payment-service
+Environment: production
+Severity: HIGH
+
+Request processing failed.
+
+Traceback (most recent call last):
+  File "app/services/payment.py", line 3, in process_payment
+    address = request["billing_address"]
+KeyError: 'billing_address'
